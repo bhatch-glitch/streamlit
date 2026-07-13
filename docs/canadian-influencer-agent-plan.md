@@ -83,14 +83,14 @@ Daily Shift Orchestrator
 
 | Tool | Responsibility | Likely implementation |
 |---|---|---|
-| `discover_candidates` | Return candidate creators for a niche/hashtag/geo query | Platform APIs where available; Playwright-driven collection where not; optional 3rd-party discovery API |
+| `discover_candidates` | Return candidate creators for a niche/geo/brand-mention query | **CreatorIQ Discovery API (preferred)**; else platform APIs / permitted discovery vendors; Playwright as last resort (see §4.1) |
 | `fetch_profile` | Pull full profile + recent posts for a handle | Platform APIs / Playwright |
 | `check_program_membership` | Check a handle/email against the active-participant roster | **Creator Connect** Apps Script Web App endpoint, or Google Sheets API on the roster sheet (see §4.2) |
 | `verify_location` | Score how likely the creator is Canada-based | Multi-signal resolver (see §4.3) |
 | `find_email` | Find + verify a contact email | Bio/link parsing first; enrichment API (e.g. Hunter/Apollo) as fallback; MX/SMTP verification |
 | `score_candidate` | Return brand-fit + audience-quality + authenticity scores | LLM against the Maple rubric + computed metrics |
 | `draft_outreach` | Produce a personalized EN or FR-CA email | LLM using the profile + template + program facts |
-| `send_email` | Send via the transactional/ESP provider | ESP API (must support CASL headers + unsubscribe) |
+| `send_email` | Auto-send from `influencers@wayfair.ca` | Google Workspace/Gmail API or transactional ESP; must support the `wayfair.ca` sender, CASL headers + List-Unsubscribe |
 | `log_event` | Persist candidate + every decision/interaction | System of record (see §3.4) |
 | `escalate` | Queue an item for human review | Review queue / Slack |
 
@@ -126,15 +126,40 @@ path to Postgres) with at least:
 
 ### 4.1 Stage 1 — Discovery (sourcing 50–100/day)
 
-- Maintain a **sourcing playbook**: prioritized niches × Canadian geo-signals × platforms, with weekly
-  rotation so we don't re-scrape the same pool.
-- Canadian discovery seeds: geo hashtags and place tags (`#torontocreator`, `#vancouvermom`,
-  `#montrealhome`, `#canadianhomedecor`, `#yyc`, `#yeg`, city/place tags), audience-lookalikes of already
-  accepted creators, and "creators who tagged Canadian retailers/home brands."
-- **Prefer official/permitted access paths.** Use platform APIs and permitted discovery vendors first.
-  Where automated browsing is used, it is rate-limited, respects ToS boundaries, and is treated as a
-  fallback (see §6 on legal/ToS).
-- Output: a raw candidate list, deduped against the system of record before any further work is spent.
+**Primary source — CreatorIQ Discovery (preferred).** We're already on CreatorIQ, and its Discovery
+product is purpose-built for exactly this: search a database of millions of creators by brand
+name/keywords and refine with filters for **location (Canada / province), audience demographics,
+engagement quality, content style, and brand affinity**, with a feed of recent **brand mentions** (e.g.
+creators already talking about Wayfair / home & decor). Using CreatorIQ as the source is the cleanest
+option because:
+
+- Canadian geo-filtering and audience-demographic filters are built in (helps Stage 3 geo-vetting).
+- "Creators mentioning Wayfair / competitors / home-decor keywords" is a high-intent seed list.
+- It stays inside the platform the program already runs on, so accepted creators flow straight through.
+
+**Access caveat:** CreatorIQ's API is a private, enterprise GraphQL/REST interface, and *programmatic*
+access to Discovery search specifically is contract-dependent — it is **not guaranteed to be exposed via
+the API on every plan**. Two implementation modes depending on what the CreatorIQ contract allows
+(confirm with the CreatorIQ account rep — see open questions):
+
+1. **CreatorIQ Discovery API (fully automated):** the agent queries Discovery directly (location=Canada +
+   niche/keyword/brand-mention filters), pulls candidate lists, and ingests them. This is the target.
+2. **CreatorIQ Discovery UI → export → ingest (semi-automated):** if Discovery isn't API-accessible, a
+   human runs saved Discovery searches and exports lists (or Playwright drives the UI within ToS); the
+   agent ingests the export and takes over from screening onward.
+
+**Fallback / supplementary sources** (used if CreatorIQ Discovery is unavailable via API, or to widen the
+top of funnel):
+
+- **Platform APIs** (Meta/Instagram, TikTok, YouTube Data) for hashtag/keyword/geo discovery.
+- **Permitted third-party discovery vendors** (e.g. Modash / HypeAuditor-class tools) with Canada +
+  audience-geo filters.
+- **Canadian discovery seeds:** geo hashtags and place tags (`#torontocreator`, `#vancouvermom`,
+  `#montrealhome`, `#canadianhomedecor`, `#yyc`, `#yeg`), audience-lookalikes of already-accepted
+  creators, and creators who tag Canadian retailers/home brands.
+- **Playwright** browsing is a rate-limited last resort, kept within ToS boundaries (see §6).
+
+Output: a raw candidate list, deduped against the system of record before any further work is spent.
 
 ### 4.2 Stage 2 — Existing-member & prior-contact screening (via Creator Connect)
 
@@ -224,16 +249,44 @@ No single signal is trusted. `verify_location` combines and weights:
 - Output: tier A/B/C + a short human-readable rationale. C-tier and fraud-flagged candidates are
   suppressed or escalated rather than contacted.
 
-### 4.6 Stage 6 — Personalized outreach + follow-ups
+### 4.6 Stage 6 — Personalized outreach + follow-ups (automatic send)
 
-- `draft_outreach` writes a genuinely personalized email: references specific recent content, states why
-  they fit Wayfair Canada, explains the program (perks, commission/gifting, expectations), and gives a
-  single clear CTA. **Language auto-selected** (EN or FR-CA).
-- Templates are **structured with personalization slots**, not free-form each time — this keeps tone
-  on-brand and reviewable while the personalization stays authentic.
+This is fully automated: once a candidate clears screening, geo-vetting, enrichment, qualification, and
+the compliance gate, the agent **sends the email automatically** — no manual mail-merge step.
+
+- **Sent from `influencers@wayfair.ca`.** All outreach comes directly from this address, so replies land
+  in that inbox and the sender identity matches the program. Requires the `wayfair.ca` domain to
+  authorize the sending service and publish SPF/DKIM/DMARC, and the mailbox/alias to exist (see setup
+  requirements below and open questions).
+- **Proper-name personalization.** The email greets the creator by their real first name, resolved by
+  `draft_outreach` from the best available source (profile display name → name in bio/"business" field →
+  CreatorIQ profile). A **safe-fallback rule** handles missing/ambiguous names: if a confident first name
+  can't be parsed (handle-only accounts, brand/business names), use a warm neutral greeting rather than a
+  wrong or awkward one (never "Hi @handle" or "Hi undefined"), and flag low-confidence names for review.
+- **Everything needed to sign up.** The body explains the Wayfair Canada Creator Program (perks,
+  commission/gifting, expectations), references specific recent content so it reads as human-written, and
+  contains a single clear CTA — a **direct link to the signup/onboarding page** — plus any info the
+  creator needs to join (what to do next, what to expect). **Language auto-selected** (EN or FR-CA).
+- **Templated, not robotic.** Templates are **structured with personalization slots** (name, content
+  reference, niche-specific hook, signup link), so tone stays on-brand and reviewable while the
+  personalization stays authentic. Supports A/B variants.
 - **Follow-up cadence:** at most 1–2 spaced follow-ups, auto-stopped on any reply, bounce, or unsubscribe.
-- Every send passes the **compliance gate** (§5) and, in early phases, a **human approval gate** before
-  transmission.
+- **Every send passes the compliance gate** (§5): CASL footer (sender ID + `wayfair.ca` mailing address +
+  working unsubscribe), suppression check, and the active-member re-check against Creator Connect.
+
+**Sending-infrastructure options for `influencers@wayfair.ca`** (choose in Phase 0):
+
+- **Google Workspace / Gmail API or SMTP** (if `wayfair.ca` is on Workspace and `influencers@` is a real
+  mailbox): most "personal-looking," replies sit naturally in the inbox; good fit for 50–100/day.
+- **Transactional ESP** (SendGrid / Postmark / Amazon SES) with `influencers@wayfair.ca` as a verified
+  sender: better at scale, with built-in bounce/complaint webhooks and List-Unsubscribe headers; route
+  replies back to the mailbox.
+
+**On "automatic":** the end state is hands-off automatic sending. Because the emails go out under the
+`wayfair.ca` brand domain, the plan still recommends a **short supervised warm-up** (human approval on the
+first batches while sender reputation ramps), then flips to automatic send for A-tier, high-confidence,
+compliant candidates. The approval gate is a configurable dial, not a permanent requirement — see §8
+Phases 3–4 and the autonomy-threshold open question.
 
 ---
 
@@ -286,8 +339,12 @@ Reuse what's already here to minimize new surface area:
   the tools in §3.2. Add a lightweight agent loop / orchestration layer.
 - **Storage:** start with SQLite/CSV under a new `agent/` package alongside `creatoriq/`; graduate to
   Postgres if volume warrants.
-- **Email/ESP:** a transactional provider that supports custom headers, list-unsubscribe, bounce/complaint
-  webhooks (e.g. an ESP the org already uses).
+- **Email sending:** all outreach sent from **`influencers@wayfair.ca`** via either Google Workspace
+  (Gmail API/SMTP) or a transactional ESP (SendGrid/Postmark/SES). Requires `wayfair.ca` DNS
+  (SPF/DKIM/DMARC) authorizing the sender, the mailbox/alias to exist, custom headers + List-Unsubscribe,
+  and bounce/complaint webhooks. Replies route back to the `influencers@wayfair.ca` inbox.
+- **Discovery:** CreatorIQ Discovery API preferred (same platform the program runs on), with platform
+  APIs / permitted vendors / Playwright as fallbacks (see §4.1).
 - **UI:** extend the existing Streamlit app with a **"Recruitment" dashboard** — daily shift report,
   approval queue, escalations, funnel metrics — reusing the current Looker-styled theme.
 - **Creator Connect (program roster):** the existing Google Apps Script / Sheets system is the authoritative
@@ -324,7 +381,10 @@ Phases are ordered by dependency and risk, not calendar time. Each phase is inde
 ### Phase 0 — Foundations & compliance guardrails
 - Legal/privacy review of the CASL approach; approve consent basis + templates.
 - Stand up the system of record (data model in §3.4) and the global suppression list.
-- Set up the ESP: domain/subdomain, SPF/DKIM/DMARC, unsubscribe + bounce/complaint webhooks.
+- **Set up sending from `influencers@wayfair.ca`:** configure the mailbox/alias, publish SPF/DKIM/DMARC on
+  `wayfair.ca`, wire unsubscribe + bounce/complaint handling, and verify a test send/reply round-trip.
+- **Confirm CreatorIQ Discovery access:** determine with the CreatorIQ account rep whether Discovery is
+  API-accessible (automated) or UI-only (export/ingest), and build the `discover_candidates` client accordingly.
 - Encode the Maple persona + scoring rubric.
 - **Stand up the Creator Connect integration:** confirm access (service account view access or a deployed
   Web App endpoint), confirm the roster's handle/email/status columns, and build `check_program_membership`.
@@ -342,15 +402,16 @@ Phases are ordered by dependency and risk, not calendar time. Each phase is inde
 - Produce a daily **qualified + enriched** shortlist. Still no automated sending.
 - **Exit gate:** email verification pass-rate and scoring quality validated against human spot-checks.
 
-### Phase 3 — Outreach with human-in-the-loop
-- Implement `draft_outreach`, `send_email`, the CASL compliance gate, and follow-up logic.
-- **Every email requires human approval** in the Streamlit approval queue before sending.
-- Start with a small daily volume; warm up the sending domain.
+### Phase 3 — Automatic outreach (supervised warm-up)
+- Implement `draft_outreach` (proper-name merge + signup link + program info), `send_email` from
+  `influencers@wayfair.ca`, the CASL compliance gate, and follow-up logic.
+- Emails **send automatically**, but during warm-up a human approves the first batches in the Streamlit
+  approval queue while `wayfair.ca` sender reputation ramps and volume is small.
 - **Exit gate:** approval-acceptance rate high, bounce/complaint rates within thresholds, replies logged.
 
-### Phase 4 — Supervised autonomy & scale
-- Auto-send A-tier, high-confidence, clearly-compliant candidates; keep humans on B/C-tier and all edge
-  cases. Ramp to the full 50–100/day cap.
+### Phase 4 — Full automatic send & scale
+- **Flip to hands-off automatic send** for A-tier, high-confidence, clearly-compliant candidates; keep
+  humans on B/C-tier and all edge cases. Ramp to the full 50–100/day cap.
 - Add EN/FR-CA auto-selection, follow-up sequences, and reply triage.
 - Wire accepted creators into CreatorIQ; surface the full funnel in the Recruitment dashboard.
 - **Exit gate:** stable KPIs (§9), no compliance incidents, positive reply/acceptance trend.
@@ -392,11 +453,15 @@ domain reputation, geo-vet precision (human-audited), and personalization qualit
 
 1. **Legal/consent:** Which CASL exemption(s) are we relying on for cold B2B outreach, and who signs off?
    What physical mailing address and sender identity go in the footer?
-2. **Discovery data source:** Approved to use official platform APIs and/or a paid discovery vendor
-   (which one?), or is Playwright fallback the primary path? This drives ToS risk and cost.
+2. **CreatorIQ Discovery API access:** does the current CreatorIQ contract expose Discovery search via
+   the API (fully automated), or only via the UI (export/ingest)? Confirm with the CreatorIQ account rep.
+   This determines whether discovery is hands-off or semi-automated, and whether fallback sources are needed.
 3. **Enrichment vendor:** Which email-finding/verification provider (Hunter, Apollo, other) is approved?
-4. **ESP:** Which sending provider, and can we use a dedicated subdomain for warmup?
-5. **Program terms to state in the email:** commission/gifting structure, expectations, and CTA/landing page.
+4. **Sending from `influencers@wayfair.ca`:** who controls `wayfair.ca` DNS to publish SPF/DKIM/DMARC and
+   authorize the sender? Is `influencers@wayfair.ca` a Google Workspace mailbox (use Gmail API) or should
+   we send via an ESP with it as a verified sender? Any brand/deliverability rules on the apex domain?
+5. **Signup flow + program terms:** the exact **signup/onboarding page URL** to link, plus commission/
+   gifting structure and expectations to state in the email.
 6. **Autonomy threshold:** at what tier/confidence are we comfortable auto-sending vs. requiring approval?
 7. **Bilingual scope:** is FR-CA outreach in scope for launch, and who reviews FR-CA copy?
 8. **Storage/scale:** stay on SQLite/CSV to match the current repo, or provision Postgres from the start?
