@@ -72,8 +72,9 @@ tool-calling. A daily "shift" orchestrator manages the batch, budget, and rate l
 Daily Shift Orchestrator
   ├─ builds today's sourcing plan (niches, hashtags, geos, platforms) within volume budget
   ├─ for each candidate:
-  │     Discovery tool → Geo-vetting tool → Enrichment tool → Qualification (LLM+rubric)
-  │        → Personalization (LLM) → Compliance gate → [Human approval] → Send tool
+  │     Discovery → Program-membership screen (Creator Connect) → Geo-vetting → Enrichment
+  │        → Qualification (LLM+rubric) → Personalization (LLM)
+  │        → Compliance gate (re-checks Creator Connect) → [Human approval] → Send tool
   ├─ enforces caps (per-day, per-domain, per-platform) and dedupe against system of record
   └─ writes a shift report (candidates seen, qualified, contacted, escalated, skipped + reasons)
 ```
@@ -84,7 +85,8 @@ Daily Shift Orchestrator
 |---|---|---|
 | `discover_candidates` | Return candidate creators for a niche/hashtag/geo query | Platform APIs where available; Playwright-driven collection where not; optional 3rd-party discovery API |
 | `fetch_profile` | Pull full profile + recent posts for a handle | Platform APIs / Playwright |
-| `verify_location` | Score how likely the creator is Canada-based | Multi-signal resolver (see §4.2) |
+| `check_program_membership` | Check a handle/email against the active-participant roster | **Creator Connect** Apps Script Web App endpoint, or Google Sheets API on the roster sheet (see §4.2) |
+| `verify_location` | Score how likely the creator is Canada-based | Multi-signal resolver (see §4.3) |
 | `find_email` | Find + verify a contact email | Bio/link parsing first; enrichment API (e.g. Hunter/Apollo) as fallback; MX/SMTP verification |
 | `score_candidate` | Return brand-fit + audience-quality + authenticity scores | LLM against the Maple rubric + computed metrics |
 | `draft_outreach` | Produce a personalized EN or FR-CA email | LLM using the profile + template + program facts |
@@ -111,6 +113,8 @@ path to Postgres) with at least:
 - Identity: platform handles, display name, profile URLs, follower counts, primary niche.
 - Location: resolved country/province/city, confidence score, and the raw signals used.
 - Contact: email, email verification status/source, `consent_status`, `unsubscribed_at`.
+- Program membership: `program_status` (not_a_member / active_member / former_member / unknown),
+  `creator_connect_matched_on` (handle/email/name), `creator_connect_row_ref`, `membership_checked_at`.
 - Scoring: brand_fit, audience_quality, authenticity/fraud score, tier (A/B/C), language (EN/FR-CA).
 - Lifecycle: `status` (discovered → vetted → enriched → qualified → queued → contacted → replied →
   accepted/declined/unsubscribed/suppressed), timestamps, and the agent's rationale at each step.
@@ -118,7 +122,7 @@ path to Postgres) with at least:
 
 ---
 
-## 4. The Daily Pipeline (5 stages)
+## 4. The Daily Pipeline (6 stages)
 
 ### 4.1 Stage 1 — Discovery (sourcing 50–100/day)
 
@@ -132,7 +136,62 @@ path to Postgres) with at least:
   fallback (see §6 on legal/ToS).
 - Output: a raw candidate list, deduped against the system of record before any further work is spent.
 
-### 4.2 Stage 2 — Canadian geo-vetting
+### 4.2 Stage 2 — Existing-member & prior-contact screening (via Creator Connect)
+
+**Recruitment is signup-oriented — we must never email a creator who is already an active participant
+in the Wayfair Canada Creator Program, nor anyone we've already contacted or suppressed.** This screen
+runs immediately after discovery and *before* any effort is spent on geo-vetting, enrichment, or scoring,
+so we never waste budget (or risk annoying an existing partner) on someone already in the program.
+
+**Source of truth — Creator Connect.** The active-participant roster lives in **Creator Connect**, the
+existing Google Apps Script (Google Sheets–backed) system that manages the program's creators. The
+backing spreadsheet is:
+
+> `https://docs.google.com/spreadsheets/d/1_OOr2bqbVbCHytMw6qbrNqiFrEunXiv5wH38oLYvwH4/edit`
+> (sheet ID `1_OOr2bqbVbCHytMw6qbrNqiFrEunXiv5wH38oLYvwH4`)
+
+The agent treats Creator Connect as the authoritative membership list and reuses/extends that existing
+code rather than duplicating the roster. Two supported integration paths (pick per the current script's
+shape):
+
+- **Apps Script Web App endpoint (preferred):** extend the existing Creator Connect script with a
+  read-only `doGet`/`doPost` handler (e.g. `?action=lookup&handles=...`) deployed as a Web App, returning
+  each handle's membership status. The agent calls this endpoint to check candidates in batches. Auth via
+  a shared token/service credential. This reuses Creator Connect's own view of the sheet (including any
+  normalization/columns it already understands) instead of re-implementing them.
+- **Google Sheets API (fallback):** read the roster sheet directly via the Sheets API using a service
+  account that has been granted view access.
+
+> **Access note:** the spreadsheet above is currently link-restricted (not world-readable — an
+> unauthenticated fetch returns HTTP 401). Whichever path is chosen, it needs credentials: share the sheet
+> with a **service account** (Sheets API path) or deploy the **Creator Connect Web App** with an access
+> token the agent can use. The exact column names (handles per platform, email, status/active flag) still
+> need to be confirmed against the live sheet — see open questions.
+
+**Matching logic** (a membership match must be robust, not just exact-string):
+
+- Normalize and match on platform handles (case-insensitive, strip `@`/URLs), known email, and
+  display-name + platform as a secondary signal.
+- Account for handle changes and multi-platform creators — a creator active on one platform is still an
+  existing member even if discovered on another. Where Creator Connect stores cross-platform identity,
+  use it; otherwise fuzzy-match and **escalate ambiguous matches to a human** rather than risk emailing an
+  active partner.
+
+**Outcomes:**
+
+- **Active participant** → mark `already_in_program`, suppress, and skip (log the Creator Connect match).
+- **Previously contacted / unsubscribed / suppressed** (from our own system of record) → skip with reason.
+- **Former/inactive participant** → route per program policy (default: **escalate**, since re-recruiting a
+  churned creator is a judgment call, not a cold-outreach decision).
+- **No match** → proceed to geo-vetting.
+- **Lookup error / Creator Connect unreachable** → **fail closed**: do not send. Hold the candidate and
+  retry/escalate rather than assuming "not a member."
+
+This check is also mirrored as a **final pre-send guard** in the compliance gate (§5): re-verify against
+Creator Connect at send time so roster changes between discovery and send can't slip an active member into
+an outreach batch.
+
+### 4.3 Stage 3 — Canadian geo-vetting
 
 No single signal is trusted. `verify_location` combines and weights:
 
@@ -145,7 +204,7 @@ No single signal is trusted. `verify_location` combines and weights:
   - Ambiguous / conflicting → **escalate to human**, do not send.
   - Confidently non-Canadian → skip with reason.
 
-### 4.3 Stage 3 — Email enrichment
+### 4.4 Stage 4 — Email enrichment
 
 - Order of preference: (1) email in bio / linktree / "business inquiries" field, (2) email on a linked
   website/press page, (3) enrichment API fallback.
@@ -155,7 +214,7 @@ No single signal is trusted. `verify_location` combines and weights:
 - If no acceptable email is found → mark `enrichment_failed` and (optionally) queue an on-platform DM
   path for a later phase, or escalate. Do not fabricate addresses.
 
-### 4.4 Stage 4 — Qualification & scoring
+### 4.5 Stage 5 — Qualification & scoring
 
 `score_candidate` produces three scores plus a tier, using computed metrics + the Maple rubric:
 
@@ -165,7 +224,7 @@ No single signal is trusted. `verify_location` combines and weights:
 - Output: tier A/B/C + a short human-readable rationale. C-tier and fraud-flagged candidates are
   suppressed or escalated rather than contacted.
 
-### 4.5 Stage 5 — Personalized outreach + follow-ups
+### 4.6 Stage 6 — Personalized outreach + follow-ups
 
 - `draft_outreach` writes a genuinely personalized email: references specific recent content, states why
   they fit Wayfair Canada, explains the program (perks, commission/gifting, expectations), and gives a
@@ -192,6 +251,9 @@ constraint, so it is enforced in code, not left to the model:
   business contact email relevant to the recipient's role) — the agent records the **consent basis and
   evidence** for each send, and only uses publicly/conspicuously published business/PR contacts.
 - **Suppression list:** unsubscribes, complaints, hard bounces, and "do not contact" are permanent.
+- **Active-member re-check:** the gate re-queries Creator Connect (§4.2) at send time and **blocks any
+  send to a creator who is already an active program participant** — recruitment is signup-oriented, so
+  existing members are never emailed.
 - **No dark patterns, no misleading subject/sender lines.**
 - **Legal sign-off** on templates and consent logic is a launch gate (see open questions).
 
@@ -228,6 +290,10 @@ Reuse what's already here to minimize new surface area:
   webhooks (e.g. an ESP the org already uses).
 - **UI:** extend the existing Streamlit app with a **"Recruitment" dashboard** — daily shift report,
   approval queue, escalations, funnel metrics — reusing the current Looker-styled theme.
+- **Creator Connect (program roster):** the existing Google Apps Script / Sheets system is the authoritative
+  active-participant list. Integrate read-only via its Apps Script Web App endpoint (preferred) or the
+  Google Sheets API with a service account (see §4.2). Reuse/extend the existing script rather than copying
+  the roster.
 - **CreatorIQ handoff:** accepted creators flow into CreatorIQ (the system the current dashboard already
   tracks), closing the loop from recruitment → activation → performance.
 
@@ -238,8 +304,9 @@ agent/
   persona.py          # Maple system prompt + rubric constants
   orchestrator.py     # daily shift loop, budget, caps, dedupe
   tools/
-    discovery.py  location.py  enrichment.py  scoring.py  outreach.py  email_send.py
-  compliance.py       # CASL gate + suppression list
+    discovery.py  membership.py  location.py  enrichment.py  scoring.py  outreach.py  email_send.py
+  creator_connect.py  # Creator Connect roster client (Web App endpoint / Sheets API)
+  compliance.py       # CASL gate + suppression list + active-member re-check
   store.py            # system of record (SQLite/CSV -> Postgres)
   reports.py          # shift report + metrics
 scripts/
@@ -259,12 +326,16 @@ Phases are ordered by dependency and risk, not calendar time. Each phase is inde
 - Stand up the system of record (data model in §3.4) and the global suppression list.
 - Set up the ESP: domain/subdomain, SPF/DKIM/DMARC, unsubscribe + bounce/complaint webhooks.
 - Encode the Maple persona + scoring rubric.
-- **Exit gate:** counsel sign-off on compliance; suppression + unsubscribe verifiably working end-to-end.
+- **Stand up the Creator Connect integration:** confirm access (service account view access or a deployed
+  Web App endpoint), confirm the roster's handle/email/status columns, and build `check_program_membership`.
+- **Exit gate:** counsel sign-off on compliance; suppression + unsubscribe verifiably working end-to-end;
+  membership lookup returns correct results on a known set of active members.
 
-### Phase 1 — Discovery + geo-vetting (read-only, no sending)
-- Implement `discover_candidates`, `fetch_profile`, `verify_location`, `log_event`.
-- Run daily to produce a **vetted Canadian candidate list** with confidence + rationale — no emails yet.
-- **Exit gate:** on a human-reviewed sample, ≥90% of "high-confidence Canada" picks are actually Canadian.
+### Phase 1 — Discovery + membership screen + geo-vetting (read-only, no sending)
+- Implement `discover_candidates`, `fetch_profile`, `check_program_membership`, `verify_location`, `log_event`.
+- Run daily to produce a **vetted, non-member Canadian candidate list** with confidence + rationale — no emails yet.
+- **Exit gate:** on a human-reviewed sample, ≥90% of "high-confidence Canada" picks are actually Canadian,
+  and **zero active Creator Connect members** appear in the candidate list.
 
 ### Phase 2 — Enrichment + qualification
 - Implement `find_email` (with verification) and `score_candidate` (fit/quality/fraud + tiering).
@@ -307,6 +378,8 @@ domain reputation, geo-vet precision (human-audited), and personalization qualit
 | CASL violation | Severe fines, legal exposure | Compliance gate in code, counsel sign-off, permanent suppression list, human approval in early phases |
 | Domain reputation damage | Emails land in spam; brand harm | Dedicated subdomain, SPF/DKIM/DMARC, warmup, bounce/complaint monitoring, hard caps |
 | Platform ToS violations / blocks | Data source loss, legal risk | Prefer official APIs/vendors; rate-limit; escalate ToS-risky steps to humans |
+| Emailing an existing program member | Wastes budget, annoys partners, off-message | Creator Connect membership screen early in pipeline + re-check at send time; escalate ambiguous matches |
+| Creator Connect access/format drift | Missed members, failed lookups | Confirm access + columns in Phase 0; fail-closed (block send) if the lookup errors rather than assuming "not a member" |
 | False-positive "Canadian" | Wasted outreach, off-target | Multi-signal resolver + confidence threshold + human escalation on ambiguity |
 | Bad email data | Bounces hurt deliverability | Multi-step verification before send; suppress on bounce |
 | Generic/off-brand outreach | Low reply rate, brand harm | Persona + structured personalization + human approval gate + quality audits |
@@ -327,6 +400,9 @@ domain reputation, geo-vet precision (human-audited), and personalization qualit
 6. **Autonomy threshold:** at what tier/confidence are we comfortable auto-sending vs. requiring approval?
 7. **Bilingual scope:** is FR-CA outreach in scope for launch, and who reviews FR-CA copy?
 8. **Storage/scale:** stay on SQLite/CSV to match the current repo, or provision Postgres from the start?
+9. **Creator Connect access & schema:** grant a service account view access or deploy a read-only Web App
+   endpoint? What are the exact roster columns (per-platform handles, email, active/status flag), and how
+   are cross-platform identities and handle changes represented so membership matching is reliable?
 
 ---
 
