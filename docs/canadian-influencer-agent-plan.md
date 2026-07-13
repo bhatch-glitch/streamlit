@@ -95,7 +95,8 @@ Daily Shift Orchestrator
 | `escalate` | Queue an item for human review | Review queue / Slack |
 
 Every tool call and every LLM decision is logged with its rationale so a human can audit *why* a
-candidate was contacted, skipped, or escalated.
+candidate was contacted, skipped, or escalated. In practice most of these tools are implemented as **n8n
+workflows** that hold the credentials and perform the external calls — see §3.5.
 
 ### 3.3 Memory
 
@@ -119,6 +120,35 @@ path to Postgres) with at least:
 - Lifecycle: `status` (discovered → vetted → enriched → qualified → queued → contacted → replied →
   accepted/declined/unsubscribed/suppressed), timestamps, and the agent's rationale at each step.
 - Outreach: template/variant used, send timestamps, follow-up count, reply text, bounce/complaint flags.
+
+### 3.5 Integration & credentials layer — n8n
+
+Rather than the agent holding raw API keys and OAuth tokens for every external system, **n8n is the
+integration and credentials layer**. Access is granted by connecting each system's credentials **once**
+in n8n, and each external action becomes an n8n **workflow** the agent triggers. This is the cleanest way
+to "grant access" for this project because:
+
+- **Centralized, revocable credentials.** Google (Sheets for Creator Connect, Gmail for
+  `influencers@wayfair.ca`), CreatorIQ HTTP API, the enrichment vendor, and the ESP are all authorized in
+  n8n's credential store — not scattered through the agent's codebase. Access can be granted/revoked in
+  one place without redeploying the agent.
+- **Workflows as tools.** Each agent tool in §3.2 maps to an n8n workflow exposed via webhook (or invoked
+  through the n8n MCP server): `discover_candidates` → CreatorIQ HTTP node, `check_program_membership` →
+  Google Sheets/Apps Script node on the Creator Connect sheet, `find_email` → enrichment HTTP node,
+  `send_email` → Gmail node sending as `influencers@wayfair.ca`, `log_event` → append to the store.
+- **Scheduling built in.** The daily "shift" can be a cron/schedule trigger in n8n, or the agent can drive
+  it and call n8n workflows per candidate.
+- **Already available here.** Two n8n MCP servers are configured for this workspace
+  (`Wf-plats-n8n-staging`, `Wf-plats-n8n-prod`), so the agent can invoke n8n workflows directly via MCP.
+
+> **Current status:** at time of writing, both n8n MCP servers fail live tool discovery (connection needs
+> fixing) — a Phase 0 setup item. The design does not depend on which transport is used: the agent can
+> call n8n via MCP or via plain webhook URLs.
+
+**Division of labor:** n8n handles *access and execution* (auth, API calls, sending, sheet reads). The
+agent handles *reasoning* (geo-vetting judgment, scoring, personalization, escalation decisions). Keep
+CASL enforcement and the active-member re-check in the agent's compliance gate (or a dedicated n8n
+workflow the agent must call), so guardrails aren't bypassable by a raw send node.
 
 ---
 
@@ -186,6 +216,9 @@ shape):
   normalization/columns it already understands) instead of re-implementing them.
 - **Google Sheets API (fallback):** read the roster sheet directly via the Sheets API using a service
   account that has been granted view access.
+- **Via n8n (recommended for access grant):** connect Google in n8n once and expose a "membership lookup"
+  workflow (Google Sheets / Apps Script node) that the agent calls — this is the simplest way to grant the
+  agent read access to Creator Connect without handling Google credentials directly (see §3.5).
 
 > **Access note:** the spreadsheet above is currently link-restricted (not world-readable — an
 > unauthenticated fetch returns HTTP 401). Whichever path is chosen, it needs credentials: share the sheet
@@ -281,6 +314,10 @@ the compliance gate, the agent **sends the email automatically** — no manual m
 - **Transactional ESP** (SendGrid / Postmark / Amazon SES) with `influencers@wayfair.ca` as a verified
   sender: better at scale, with built-in bounce/complaint webhooks and List-Unsubscribe headers; route
   replies back to the mailbox.
+- **Via n8n (recommended for access grant):** authorize Gmail/Workspace (or the ESP) once in n8n and
+  expose a "send outreach" workflow the agent calls — n8n sends as `influencers@wayfair.ca` using its
+  stored credential, so the agent never handles the mailbox credentials directly (see §3.5). The
+  compliance gate still runs before the send workflow is invoked.
 
 **On "automatic":** the end state is hands-off automatic sending. Because the emails go out under the
 `wayfair.ca` brand domain, the plan still recommends a **short supervised warm-up** (human approval on the
@@ -337,6 +374,9 @@ Reuse what's already here to minimize new surface area:
 - **Browser automation:** Playwright (already a dependency) for fallback discovery/profile fetch.
 - **Agent orchestration:** LLM with tool-calling; MCP (already a dependency) is a natural fit for exposing
   the tools in §3.2. Add a lightweight agent loop / orchestration layer.
+- **Integration & credentials — n8n:** external access (CreatorIQ, Google Sheets/Gmail, enrichment, ESP)
+  is granted and executed through n8n workflows the agent triggers via the configured n8n MCP servers
+  (`Wf-plats-n8n-staging` / `Wf-plats-n8n-prod`) or webhooks. Centralizes credentials; see §3.5.
 - **Storage:** start with SQLite/CSV under a new `agent/` package alongside `creatoriq/`; graduate to
   Postgres if volume warrants.
 - **Email sending:** all outreach sent from **`influencers@wayfair.ca`** via either Google Workspace
@@ -380,6 +420,9 @@ Phases are ordered by dependency and risk, not calendar time. Each phase is inde
 
 ### Phase 0 — Foundations & compliance guardrails
 - Legal/privacy review of the CASL approach; approve consent basis + templates.
+- **Set up n8n as the access layer:** fix the n8n MCP connection (staging or prod), connect credentials
+  (Google for Creator Connect + `influencers@wayfair.ca`, CreatorIQ, enrichment, ESP), and stub the
+  workflows that back the agent's tools (§3.5).
 - Stand up the system of record (data model in §3.4) and the global suppression list.
 - **Set up sending from `influencers@wayfair.ca`:** configure the mailbox/alias, publish SPF/DKIM/DMARC on
   `wayfair.ca`, wire unsubscribe + bounce/complaint handling, and verify a test send/reply round-trip.
@@ -465,9 +508,13 @@ domain reputation, geo-vet precision (human-audited), and personalization qualit
 6. **Autonomy threshold:** at what tier/confidence are we comfortable auto-sending vs. requiring approval?
 7. **Bilingual scope:** is FR-CA outreach in scope for launch, and who reviews FR-CA copy?
 8. **Storage/scale:** stay on SQLite/CSV to match the current repo, or provision Postgres from the start?
-9. **Creator Connect access & schema:** grant a service account view access or deploy a read-only Web App
-   endpoint? What are the exact roster columns (per-platform handles, email, active/status flag), and how
-   are cross-platform identities and handle changes represented so membership matching is reliable?
+9. **Creator Connect access & schema:** grant access via **n8n** (connect Google once, expose a lookup
+   workflow — the offered path), a service account with view access, or a Web App endpoint? What are the
+   exact roster columns (per-platform handles, email, active/status flag), and how are cross-platform
+   identities and handle changes represented so membership matching is reliable?
+10. **n8n setup:** use `Wf-plats-n8n-staging` or `Wf-plats-n8n-prod` (both MCP connections currently fail
+    discovery and need fixing)? Which credentials (Google, CreatorIQ, enrichment, ESP) will be connected
+    in n8n, and will external actions be exposed as MCP tools, webhooks, or both?
 
 ---
 
